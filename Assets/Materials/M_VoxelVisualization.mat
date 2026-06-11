@@ -1,0 +1,41 @@
+fileFormatVersion: 2
+guid: a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6
+Material:
+  serializedVersion: 6
+  m_ObjectHideFlags: 0
+  m_CorrespondingSourceObject: {fileID: 0}
+  m_PrefabInstance: {fileID: 0}
+  m_PrefabAsset: {fileID: 0}
+  m_Name: M_VoxelVisualization
+  m_Shader: {fileID: 4800000, guid: 0000000000000000e000000000000000, type: 0}
+  m_ShaderKeywords: 
+  m_LightmapFlags: 4
+  m_EnableInstancingVariants: 0
+  m_DoubleSidedGI: 0
+  m_CustomRenderQueue: 3000
+  stringTagMap:
+    RenderType: Transparent
+    Queue: Transparent
+  disabledShaderPasses: []
+  m_SavedProperties:
+    serializedVersion: 3
+    m_TexEnvs:
+    - _VoxelTexture:
+        m_Texture: {fileID: 0}
+        m_Scale: {x: 1, y: 1}
+        m_Offset: {x: 0, y: 0}
+    m_Floats:
+    - _AlphaCutoff: 0.1
+    - _VoxelSizeX: 0.5
+    - _VoxelSizeY: 0.5
+    - _VoxelSizeZ: 0.5
+    - _GridSizeX: 64
+    - _GridSizeY: 32
+    - _GridSizeZ: 64
+    - _GridMinX: 0
+    - _GridMinY: 0
+    - _GridMinZ: 0
+    m_Colors:
+    - _SubmergedColor: {r: 0.2, g: 0.5, b: 0.9, a: 0.8}
+    - _DryColor: {r: 0.8, g: 0.6, b: 0.3, a: 0.9}
+    - _WireframeColor: {r: 1, g: 1, b: 1, a: 0.3}

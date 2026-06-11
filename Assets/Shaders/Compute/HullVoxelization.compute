@@ -1,0 +1,440 @@
+#pragma kernel VoxelizeHull
+#pragma kernel ReduceVolume
+#pragma kernel ReduceArea
+#pragma kernel BuildVoxelTexture
+#pragma kernel ClearVoxelGrid
+
+#define THREAD_GROUP_SIZE_X 8
+#define THREAD_GROUP_SIZE_Y 8
+#define THREAD_GROUP_SIZE_Z 8
+
+#define MAX_TRIANGLES_PER_VOXEL 16
+
+struct Triangle
+{
+    float3 v0;
+    float3 v1;
+    float3 v2;
+    float3 normal;
+};
+
+struct VoxelData
+{
+    uint isInside;
+    uint isSubmerged;
+    float distanceToSurface;
+    float3 normal;
+    float submergedFraction;
+};
+
+struct ReductionResult
+{
+    float displacedVolume;
+    float wettedSurfaceArea;
+    float waterplaneArea;
+    float3 centerOfBuoyancy;
+    uint voxelCount;
+};
+
+RWStructuredBuffer<VoxelData> _VoxelGrid;
+RWStructuredBuffer<ReductionResult> _ReductionBuffer;
+StructuredBuffer<Triangle> _HullTriangles;
+RWTexture3D<float4> _VoxelTexture;
+
+int _GridSizeX;
+int _GridSizeY;
+int _GridSizeZ;
+float3 _GridMin;
+float3 _GridMax;
+float3 _GridCellSize;
+float _WaterlineY;
+int _TriangleCount;
+float _HullDensity;
+float _Time;
+
+float3 GetVoxelWorldPos(int3 gridPos)
+{
+    return _GridMin + float3(gridPos) * _GridCellSize + _GridCellSize * 0.5f;
+}
+
+int GetVoxelIndex(int3 gridPos)
+{
+    return gridPos.x + gridPos.y * _GridSizeX + gridPos.z * _GridSizeX * _GridSizeY;
+}
+
+int3 GetGridPos(float3 worldPos)
+{
+    float3 local = worldPos - _GridMin;
+    return int3(local / _GridCellSize);
+}
+
+bool IsInsideBounds(int3 gridPos)
+{
+    return gridPos.x >= 0 && gridPos.x < _GridSizeX &&
+           gridPos.y >= 0 && gridPos.y < _GridSizeY &&
+           gridPos.z >= 0 && gridPos.z < _GridSizeZ;
+}
+
+float SignedDistanceToTriangle(float3 p, float3 v0, float3 v1, float3 v2)
+{
+    float3 e0 = v1 - v0;
+    float3 e1 = v2 - v0;
+    float3 v0p = p - v0;
+
+    float3 normal = normalize(cross(e0, e1));
+
+    float d = dot(v0p, normal);
+
+    float3 e2 = v2 - v1;
+    float3 v1p = p - v1;
+    float3 v2p = p - v2;
+
+    float3 c0 = cross(e0, v0p);
+    float3 c1 = cross(e2, v1p);
+    float3 c2 = cross(-e1, v2p);
+
+    bool inside = dot(c0, c1) > 0 && dot(c1, c2) > 0 && dot(c2, c0) > 0;
+
+    if (inside)
+    {
+        return abs(d);
+    }
+
+    float3 edge0 = v0 + e0 * clamp(dot(v0p, e0) / dot(e0, e0), 0.0f, 1.0f);
+    float3 edge1 = v1 + e2 * clamp(dot(v1p, e2) / dot(e2, e2), 0.0f, 1.0f);
+    float3 edge2 = v0 + e1 * clamp(dot(v0p, e1) / dot(e1, e1), 0.0f, 1.0f);
+
+    float d0 = distance(p, edge0);
+    float d1 = distance(p, edge1);
+    float d2 = distance(p, edge2);
+
+    float minDist = min(min(d0, d1), d2);
+
+    float d_v0 = distance(p, v0);
+    float d_v1 = distance(p, v1);
+    float d_v2 = distance(p, v2);
+
+    minDist = min(minDist, min(min(d_v0, d_v1), d_v2));
+
+    return d >= 0 ? minDist : -minDist;
+}
+
+float3 Barycentric(float3 p, float3 v0, float3 v1, float3 v2)
+{
+    float3 v0v1 = v1 - v0;
+    float3 v0v2 = v2 - v0;
+    float3 v0p = p - v0;
+
+    float d00 = dot(v0v1, v0v1);
+    float d01 = dot(v0v1, v0v2);
+    float d11 = dot(v0v2, v0v2);
+    float d20 = dot(v0p, v0v1);
+    float d21 = dot(v0p, v0v2);
+
+    float denom = d00 * d11 - d01 * d01;
+    if (abs(denom) < 1e-8f) return float3(0.333f, 0.333f, 0.333f);
+
+    float v = (d11 * d20 - d01 * d21) / denom;
+    float w = (d00 * d21 - d01 * d20) / denom;
+    float u = 1.0f - v - w;
+
+    return float3(u, v, w);
+}
+
+bool RayTriangleIntersect(float3 rayOrigin, float3 rayDir, float3 v0, float3 v1, float3 v2, out float t)
+{
+    t = 0.0f;
+    float3 e1 = v1 - v0;
+    float3 e2 = v2 - v0;
+    float3 h = cross(rayDir, e2);
+    float a = dot(e1, h);
+
+    if (abs(a) < 1e-8f) return false;
+
+    float f = 1.0f / a;
+    float3 s = rayOrigin - v0;
+    float u = f * dot(s, h);
+
+    if (u < 0.0f || u > 1.0f) return false;
+
+    float3 q = cross(s, e1);
+    float w = f * dot(rayDir, q);
+
+    if (w < 0.0f || u + w > 1.0f) return false;
+
+    t = f * dot(e2, q);
+    return t > 1e-8f;
+}
+
+[numthreads(THREAD_GROUP_SIZE_X, THREAD_GROUP_SIZE_Y, THREAD_GROUP_SIZE_Z)]
+void ClearVoxelGrid(uint3 id : SV_DispatchThreadID)
+{
+    int3 gridPos = int3(id.x, id.y, id.z);
+    if (!IsInsideBounds(gridPos)) return;
+
+    int idx = GetVoxelIndex(gridPos);
+    _VoxelGrid[idx].isInside = 0;
+    _VoxelGrid[idx].isSubmerged = 0;
+    _VoxelGrid[idx].distanceToSurface = 1000.0f;
+    _VoxelGrid[idx].normal = float3(0, 1, 0);
+    _VoxelGrid[idx].submergedFraction = 0.0f;
+}
+
+[numthreads(THREAD_GROUP_SIZE_X, THREAD_GROUP_SIZE_Y, THREAD_GROUP_SIZE_Z)]
+void VoxelizeHull(uint3 id : SV_DispatchThreadID)
+{
+    int3 gridPos = int3(id.x, id.y, id.z);
+    if (!IsInsideBounds(gridPos)) return;
+
+    int idx = GetVoxelIndex(gridPos);
+    float3 voxelCenter = GetVoxelWorldPos(gridPos);
+
+    int hitCount = 0;
+    float minDist = 1000.0f;
+    float3 accumulatedNormal = float3(0, 0, 0);
+
+    float3 rayDir = float3(1.0f, 0.001f, 0.002f);
+    rayDir = normalize(rayDir);
+
+    for (int triIdx = 0; triIdx < _TriangleCount; triIdx++)
+    {
+        Triangle tri = _HullTriangles[triIdx];
+
+        float t;
+        if (RayTriangleIntersect(voxelCenter, rayDir, tri.v0, tri.v1, tri.v2, t))
+        {
+            if (t > 1e-6f)
+            {
+                hitCount++;
+            }
+        }
+
+        float dist = SignedDistanceToTriangle(voxelCenter, tri.v0, tri.v1, tri.v2);
+        if (abs(dist) < abs(minDist))
+        {
+            minDist = dist;
+            accumulatedNormal = tri.normal;
+        }
+    }
+
+    bool isInside = (hitCount % 2 == 1);
+
+    if (isInside)
+    {
+        _VoxelGrid[idx].isInside = 1;
+        _VoxelGrid[idx].distanceToSurface = -abs(minDist);
+    }
+    else
+    {
+        _VoxelGrid[idx].isInside = 0;
+        _VoxelGrid[idx].distanceToSurface = abs(minDist);
+    }
+
+    _VoxelGrid[idx].normal = normalize(accumulatedNormal);
+
+    if (voxelCenter.y < _WaterlineY)
+    {
+        if (isInside)
+        {
+            float cellHeight = _GridCellSize.y;
+            float voxelBottom = voxelCenter.y - cellHeight * 0.5f;
+            float voxelTop = voxelCenter.y + cellHeight * 0.5f;
+
+            if (voxelTop <= _WaterlineY)
+            {
+                _VoxelGrid[idx].isSubmerged = 1;
+                _VoxelGrid[idx].submergedFraction = 1.0f;
+            }
+            else if (voxelBottom < _WaterlineY)
+            {
+                _VoxelGrid[idx].isSubmerged = 1;
+                _VoxelGrid[idx].submergedFraction = (_WaterlineY - voxelBottom) / cellHeight;
+            }
+        }
+    }
+}
+
+groupshared float g_sharedVolume[THREAD_GROUP_SIZE_X * THREAD_GROUP_SIZE_Y * THREAD_GROUP_SIZE_Z];
+groupshared float g_sharedArea[THREAD_GROUP_SIZE_X * THREAD_GROUP_SIZE_Y * THREAD_GROUP_SIZE_Z];
+groupshared float g_sharedWPArea[THREAD_GROUP_SIZE_X * THREAD_GROUP_SIZE_Y * THREAD_GROUP_SIZE_Z];
+groupshared float3 g_sharedCOB[THREAD_GROUP_SIZE_X * THREAD_GROUP_SIZE_Y * THREAD_GROUP_SIZE_Z];
+groupshared uint g_sharedCount[THREAD_GROUP_SIZE_X * THREAD_GROUP_SIZE_Y * THREAD_GROUP_SIZE_Z];
+
+[numthreads(THREAD_GROUP_SIZE_X, THREAD_GROUP_SIZE_Y, THREAD_GROUP_SIZE_Z)]
+void ReduceVolume(uint3 id : SV_DispatchThreadID, uint groupIndex : SV_GroupIndex)
+{
+    int3 gridPos = int3(id.x, id.y, id.z);
+
+    float localVolume = 0.0f;
+    float localArea = 0.0f;
+    float localWPArea = 0.0f;
+    float3 localCOB = float3(0, 0, 0);
+    uint localCount = 0;
+
+    if (IsInsideBounds(gridPos))
+    {
+        int idx = GetVoxelIndex(gridPos);
+        VoxelData voxel = _VoxelGrid[idx];
+
+        if (voxel.isSubmerged)
+        {
+            float cellVolume = _GridCellSize.x * _GridCellSize.y * _GridCellSize.z;
+            localVolume = cellVolume * voxel.submergedFraction;
+
+            float3 worldPos = GetVoxelWorldPos(gridPos);
+            localCOB = worldPos * localVolume;
+            localCount = 1;
+
+            float cellArea = _GridCellSize.x * _GridCellSize.z;
+            float epsilon = _GridCellSize.y * 2.0f;
+            if (abs(worldPos.y - _WaterlineY) < epsilon && voxel.isInside)
+            {
+                localWPArea = cellArea;
+            }
+
+            if (abs(voxel.distanceToSurface) < _GridCellSize.x * 1.5f)
+            {
+                int3 neighbors[6] = {
+                    int3(1, 0, 0), int3(-1, 0, 0),
+                    int3(0, 1, 0), int3(0, -1, 0),
+                    int3(0, 0, 1), int3(0, 0, -1)
+                };
+
+                for (int n = 0; n < 6; n++)
+                {
+                    int3 neighborPos = gridPos + neighbors[n];
+                    if (IsInsideBounds(neighborPos))
+                    {
+                        int nIdx = GetVoxelIndex(neighborPos);
+                        if (_VoxelGrid[nIdx].isInside == 0)
+                        {
+                            float faceArea = 0.0f;
+                            if (neighbors[n].x != 0)
+                                faceArea = _GridCellSize.y * _GridCellSize.z;
+                            else if (neighbors[n].y != 0)
+                                faceArea = _GridCellSize.x * _GridCellSize.z;
+                            else
+                                faceArea = _GridCellSize.x * _GridCellSize.y;
+
+                            float3 nDir = float3(neighbors[n]);
+                            if (voxel.isSubmerged)
+                            {
+                                if (neighbors[n].y != 0 && neighborPos.y * _GridCellSize.y + _GridMin.y >= _WaterlineY)
+                                {
+                                    float partialFraction = voxel.submergedFraction;
+                                    localArea += faceArea * partialFraction;
+                                }
+                                else
+                                {
+                                    localArea += faceArea * voxel.submergedFraction;
+                                }
+                            }
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    g_sharedVolume[groupIndex] = localVolume;
+    g_sharedArea[groupIndex] = localArea;
+    g_sharedWPArea[groupIndex] = localWPArea;
+    g_sharedCOB[groupIndex] = localCOB;
+    g_sharedCount[groupIndex] = localCount;
+
+    GroupMemoryBarrierWithGroupSync();
+
+    uint totalSize = THREAD_GROUP_SIZE_X * THREAD_GROUP_SIZE_Y * THREAD_GROUP_SIZE_Z;
+    for (uint s = totalSize / 2; s > 0; s >>= 1)
+    {
+        if (groupIndex < s)
+        {
+            g_sharedVolume[groupIndex] += g_sharedVolume[groupIndex + s];
+            g_sharedArea[groupIndex] += g_sharedArea[groupIndex + s];
+            g_sharedWPArea[groupIndex] += g_sharedWPArea[groupIndex + s];
+            g_sharedCOB[groupIndex] += g_sharedCOB[groupIndex + s];
+            g_sharedCount[groupIndex] += g_sharedCount[groupIndex + s];
+        }
+        GroupMemoryBarrierWithGroupSync();
+    }
+
+    if (groupIndex == 0)
+    {
+        ReductionResult result;
+        result.displacedVolume = g_sharedVolume[0];
+        result.wettedSurfaceArea = g_sharedArea[0];
+        result.waterplaneArea = g_sharedWPArea[0];
+        result.centerOfBuoyancy = g_sharedCOB[0];
+        result.voxelCount = g_sharedCount[0];
+
+        uint groupId = id.z / THREAD_GROUP_SIZE_Z * (_GridSizeX / THREAD_GROUP_SIZE_X * _GridSizeY / THREAD_GROUP_SIZE_Y) +
+                       id.y / THREAD_GROUP_SIZE_Y * (_GridSizeX / THREAD_GROUP_SIZE_X) +
+                       id.x / THREAD_GROUP_SIZE_X;
+        _ReductionBuffer[groupId] = result;
+    }
+}
+
+[numthreads(1, 1, 1)]
+void ReduceArea(uint3 id : SV_DispatchThreadID)
+{
+    uint totalGroups = (_GridSizeX / THREAD_GROUP_SIZE_X) *
+                       (_GridSizeY / THREAD_GROUP_SIZE_Y) *
+                       (_GridSizeZ / THREAD_GROUP_SIZE_Z);
+
+    float totalVolume = 0.0f;
+    float totalArea = 0.0f;
+    float totalWPArea = 0.0f;
+    float3 totalCOB = float3(0, 0, 0);
+    uint totalVoxelCount = 0;
+
+    for (uint i = 0; i < totalGroups; i++)
+    {
+        ReductionResult r = _ReductionBuffer[i];
+        totalVolume += r.displacedVolume;
+        totalArea += r.wettedSurfaceArea;
+        totalWPArea += r.waterplaneArea;
+        totalCOB += r.centerOfBuoyancy;
+        totalVoxelCount += r.voxelCount;
+    }
+
+    if (totalVolume > 1e-8f)
+    {
+        totalCOB /= totalVolume;
+    }
+
+    ReductionResult finalResult;
+    finalResult.displacedVolume = totalVolume;
+    finalResult.wettedSurfaceArea = totalArea;
+    finalResult.waterplaneArea = totalWPArea;
+    finalResult.centerOfBuoyancy = totalCOB;
+    finalResult.voxelCount = totalVoxelCount;
+
+    _ReductionBuffer[0] = finalResult;
+}
+
+[numthreads(THREAD_GROUP_SIZE_X, THREAD_GROUP_SIZE_Y, THREAD_GROUP_SIZE_Z)]
+void BuildVoxelTexture(uint3 id : SV_DispatchThreadID)
+{
+    int3 gridPos = int3(id.x, id.y, id.z);
+    if (!IsInsideBounds(gridPos)) return;
+
+    int idx = GetVoxelIndex(gridPos);
+    VoxelData voxel = _VoxelGrid[idx];
+
+    float4 color = float4(0, 0, 0, 0);
+
+    if (voxel.isInside)
+    {
+        if (voxel.isSubmerged)
+        {
+            color = float4(voxel.normal * 0.5f + 0.5f, voxel.submergedFraction);
+        }
+        else
+        {
+            color = float4(0.8f, 0.6f, 0.3f, 0.9f);
+        }
+    }
+
+    _VoxelTexture[id] = color;
+}
