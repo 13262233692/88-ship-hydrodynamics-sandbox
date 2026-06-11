@@ -23,23 +23,32 @@ namespace ShipHydrodynamics.Water
         public float ShipBeam = 20f;
         public float ShipDraft = 8f;
 
-        [Header("Output")]
-        public RenderTexture HeightField;
-        public RenderTexture NormalField;
-        public RenderTexture VelocityField;
+        [Header("Read-Only Output (current readable state)")]
+        public RenderTexture HeightField => _heightFields[_readIndex];
+        public RenderTexture VelocityField => _velocityFields[_readIndex];
+        public RenderTexture NormalField => _normalField;
 
-        private RenderTexture _heightFieldPrev;
-        private RenderTexture _velocityFieldPrev;
+        private RenderTexture[] _heightFields = new RenderTexture[2];
+        private RenderTexture[] _velocityFields = new RenderTexture[2];
+        private RenderTexture _normalField;
         private RenderTexture _hullHeightMask;
+
+        private int _readIndex = 0;
+
+        private int ReadIdx => _readIndex;
+        private int WriteIdx => 1 - _readIndex;
 
         private ComputeBuffer _waveSourceBuffer;
 
         private int _kernelInitialize;
-        private int _kernelUpdate;
+        private int _kernelUpdateSWE;
         private int _kernelNormals;
-        private int _kernelHullInteraction;
-        private int _kernelBoundary;
-        private int _kernelAddWaves;
+        private int _kernelHullRead;
+        private int _kernelHullWrite;
+        private int _kernelBoundaryRead;
+        private int _kernelBoundaryWrite;
+        private int _kernelWaveRead;
+        private int _kernelWaveWrite;
 
         private bool _initialized;
         private float _totalTime;
@@ -64,19 +73,22 @@ namespace ShipHydrodynamics.Water
         {
             int res = Settings.GridResolution;
 
-            ReleaseTexture(ref HeightField);
-            ReleaseTexture(ref _heightFieldPrev);
-            ReleaseTexture(ref VelocityField);
-            ReleaseTexture(ref _velocityFieldPrev);
-            ReleaseTexture(ref NormalField);
+            for (int i = 0; i < 2; i++)
+            {
+                ReleaseTexture(ref _heightFields[i]);
+                ReleaseTexture(ref _velocityFields[i]);
+            }
+            ReleaseTexture(ref _normalField);
             ReleaseTexture(ref _hullHeightMask);
 
-            HeightField = CreateFloatRT(res, 1, "HeightField");
-            _heightFieldPrev = CreateFloatRT(res, 1, "HeightFieldPrev");
-            VelocityField = CreateFloatRT(res, 2, "VelocityField");
-            _velocityFieldPrev = CreateFloatRT(res, 2, "VelocityFieldPrev");
-            NormalField = CreateFloatRT(res, 4, "NormalField");
+            _heightFields[0] = CreateFloatRT(res, 1, "HeightField_A");
+            _heightFields[1] = CreateFloatRT(res, 1, "HeightField_B");
+            _velocityFields[0] = CreateFloatRT(res, 2, "VelocityField_A");
+            _velocityFields[1] = CreateFloatRT(res, 2, "VelocityField_B");
+            _normalField = CreateFloatRT(res, 4, "NormalField");
             _hullHeightMask = CreateFloatRT(res, 1, "HullHeightMask");
+
+            _readIndex = 0;
         }
 
         private RenderTexture CreateFloatRT(int resolution, int channels, string name)
@@ -118,11 +130,14 @@ namespace ShipHydrodynamics.Water
             }
 
             _kernelInitialize = SWEShader.FindKernel("InitializeWater");
-            _kernelUpdate = SWEShader.FindKernel("UpdateSWE");
+            _kernelUpdateSWE = SWEShader.FindKernel("UpdateSWE");
             _kernelNormals = SWEShader.FindKernel("UpdateNormals");
-            _kernelHullInteraction = SWEShader.FindKernel("ApplyHullInteraction");
-            _kernelBoundary = SWEShader.FindKernel("ApplyBoundaryConditions");
-            _kernelAddWaves = SWEShader.FindKernel("AddWaveSource");
+            _kernelHullRead = SWEShader.FindKernel("ApplyHullInteractionRead");
+            _kernelHullWrite = SWEShader.FindKernel("ApplyHullInteractionWrite");
+            _kernelBoundaryRead = SWEShader.FindKernel("ApplyBoundaryConditionsRead");
+            _kernelBoundaryWrite = SWEShader.FindKernel("ApplyBoundaryConditionsWrite");
+            _kernelWaveRead = SWEShader.FindKernel("AddWaveSourceRead");
+            _kernelWaveWrite = SWEShader.FindKernel("AddWaveSourceWrite");
         }
 
         private void CreateWaveSourceBuffer()
@@ -137,9 +152,26 @@ namespace ShipHydrodynamics.Water
 
         private void RunInitialization()
         {
-            SetAllTextures(_kernelInitialize);
             SetCommonParameters(_kernelInitialize);
+            SWEShader.SetTexture(_kernelInitialize, "_HeightFieldRead", _heightFields[ReadIdx]);
+            SWEShader.SetTexture(_kernelInitialize, "_HeightFieldWrite", _heightFields[WriteIdx]);
+            SWEShader.SetTexture(_kernelInitialize, "_VelocityFieldRead", _velocityFields[ReadIdx]);
+            SWEShader.SetTexture(_kernelInitialize, "_VelocityFieldWrite", _velocityFields[WriteIdx]);
+            SWEShader.SetTexture(_kernelInitialize, "_NormalField", _normalField);
+            SWEShader.SetTexture(_kernelInitialize, "_HullHeightMask", _hullHeightMask);
             Dispatch16x16(_kernelInitialize);
+
+            SwapBuffers();
+
+            SWEShader.SetTexture(_kernelInitialize, "_HeightFieldRead", _heightFields[ReadIdx]);
+            SWEShader.SetTexture(_kernelInitialize, "_HeightFieldWrite", _heightFields[WriteIdx]);
+            SWEShader.SetTexture(_kernelInitialize, "_VelocityFieldRead", _velocityFields[ReadIdx]);
+            SWEShader.SetTexture(_kernelInitialize, "_VelocityFieldWrite", _velocityFields[WriteIdx]);
+            SWEShader.SetTexture(_kernelInitialize, "_NormalField", _normalField);
+            SWEShader.SetTexture(_kernelInitialize, "_HullHeightMask", _hullHeightMask);
+            Dispatch16x16(_kernelInitialize);
+
+            SwapBuffers();
         }
 
         private void SetCommonParameters(int kernel)
@@ -169,14 +201,19 @@ namespace ShipHydrodynamics.Water
             SWEShader.SetFloat("_ShipDraft", ShipDraft);
         }
 
-        private void SetAllTextures(int kernel)
+        private void BindPingPongTextures(int kernel)
         {
-            SWEShader.SetTexture(kernel, "_HeightField", HeightField);
-            SWEShader.SetTexture(kernel, "_HeightFieldPrev", _heightFieldPrev);
-            SWEShader.SetTexture(kernel, "_VelocityField", VelocityField);
-            SWEShader.SetTexture(kernel, "_VelocityFieldPrev", _velocityFieldPrev);
-            SWEShader.SetTexture(kernel, "_NormalField", NormalField);
+            SWEShader.SetTexture(kernel, "_HeightFieldRead", _heightFields[ReadIdx]);
+            SWEShader.SetTexture(kernel, "_HeightFieldWrite", _heightFields[WriteIdx]);
+            SWEShader.SetTexture(kernel, "_VelocityFieldRead", _velocityFields[ReadIdx]);
+            SWEShader.SetTexture(kernel, "_VelocityFieldWrite", _velocityFields[WriteIdx]);
+            SWEShader.SetTexture(kernel, "_NormalField", _normalField);
             SWEShader.SetTexture(kernel, "_HullHeightMask", _hullHeightMask);
+        }
+
+        private void SwapBuffers()
+        {
+            _readIndex = 1 - _readIndex;
         }
 
         private void Dispatch16x16(int kernel)
@@ -199,34 +236,50 @@ namespace ShipHydrodynamics.Water
 
         private void SimulationStep()
         {
-            SetCommonParameters(_kernelAddWaves);
-            SetAllTextures(_kernelAddWaves);
+            // ── PASS 1: Add wave sources ──
+            // READ from current, WRITE to alternate
             if (WaveSources.Count > 0 && Settings.InteractiveWaveSources)
             {
-                SWEShader.SetBuffer(_kernelAddWaves, "_WaveSources", _waveSourceBuffer);
+                int waveKernel = _kernelWaveRead;
+                SetCommonParameters(waveKernel);
+                BindPingPongTextures(waveKernel);
+                SWEShader.SetBuffer(waveKernel, "_WaveSources", _waveSourceBuffer);
                 SWEShader.SetInt("_WaveSourceCount", WaveSources.Count);
-                Dispatch16x16(_kernelAddWaves);
+                Dispatch16x16(waveKernel);
+                SwapBuffers();
             }
 
-            SetCommonParameters(_kernelHullInteraction);
-            SetAllTextures(_kernelHullInteraction);
-            SetShipParameters(_kernelHullInteraction);
+            // ── PASS 2: Hull interaction ──
+            // READ from current (wave sources applied), WRITE to alternate
             if (ShipTransform != null && Settings.EnableKelvinWakes)
             {
-                Dispatch16x16(_kernelHullInteraction);
+                int hullKernel = _kernelHullWrite;
+                SetCommonParameters(hullKernel);
+                BindPingPongTextures(hullKernel);
+                SetShipParameters(hullKernel);
+                Dispatch16x16(hullKernel);
+                SwapBuffers();
             }
 
-            SetCommonParameters(_kernelUpdate);
-            SetAllTextures(_kernelUpdate);
-            Dispatch16x16(_kernelUpdate);
+            // ── PASS 3: SWE physics update (core) ──
+            // READ from current snapshot, WRITE to alternate — NO RACE CONDITION
+            SetCommonParameters(_kernelUpdateSWE);
+            BindPingPongTextures(_kernelUpdateSWE);
+            Dispatch16x16(_kernelUpdateSWE);
+            SwapBuffers();
 
+            // ── PASS 4: Boundary conditions ──
+            // READ from SWE output, WRITE to alternate
+            SetCommonParameters(_kernelBoundaryWrite);
+            BindPingPongTextures(_kernelBoundaryWrite);
+            Dispatch16x16(_kernelBoundaryWrite);
+            SwapBuffers();
+
+            // ── PASS 5: Update normals ──
+            // Pure READ from current, WRITE to _NormalField (no race — different target)
             SetCommonParameters(_kernelNormals);
-            SetAllTextures(_kernelNormals);
+            BindPingPongTextures(_kernelNormals);
             Dispatch16x16(_kernelNormals);
-
-            SetCommonParameters(_kernelBoundary);
-            SetAllTextures(_kernelBoundary);
-            Dispatch16x16(_kernelBoundary);
 
             OnWaterUpdated?.Invoke();
         }
@@ -250,14 +303,15 @@ namespace ShipHydrodynamics.Water
         public float GetWaterHeightAtUV(float u, float v)
         {
             RenderTexture current = RenderTexture.active;
-            RenderTexture.active = HeightField;
+            RenderTexture rt = HeightField;
+            RenderTexture.active = rt;
 
-            Texture2D tex = new Texture2D(Settings.GridResolution, Settings.GridResolution, TextureFormat.RFloat, false);
-            tex.ReadPixels(new Rect(0, 0, Settings.GridResolution, Settings.GridResolution), 0, 0);
+            Texture2D tex = new Texture2D(rt.width, rt.height, TextureFormat.RFloat, false);
+            tex.ReadPixels(new Rect(0, 0, rt.width, rt.height), 0, 0);
             tex.Apply();
 
-            int x = Mathf.Clamp(Mathf.FloorToInt(u * Settings.GridResolution), 0, Settings.GridResolution - 1);
-            int y = Mathf.Clamp(Mathf.FloorToInt(v * Settings.GridResolution), 0, Settings.GridResolution - 1);
+            int x = Mathf.Clamp(Mathf.FloorToInt(u * rt.width), 0, rt.width - 1);
+            int y = Mathf.Clamp(Mathf.FloorToInt(v * rt.height), 0, rt.height - 1);
 
             float height = tex.GetPixel(x, y).r;
 
@@ -281,14 +335,14 @@ namespace ShipHydrodynamics.Water
             );
 
             RenderTexture current = RenderTexture.active;
-            RenderTexture.active = NormalField;
+            RenderTexture.active = _normalField;
 
-            Texture2D tex = new Texture2D(Settings.GridResolution, Settings.GridResolution, TextureFormat.RGBAFloat, false);
-            tex.ReadPixels(new Rect(0, 0, Settings.GridResolution, Settings.GridResolution), 0, 0);
+            Texture2D tex = new Texture2D(_normalField.width, _normalField.height, TextureFormat.RGBAFloat, false);
+            tex.ReadPixels(new Rect(0, 0, _normalField.width, _normalField.height), 0, 0);
             tex.Apply();
 
-            int x = Mathf.Clamp(Mathf.FloorToInt(uvX * Settings.GridResolution), 0, Settings.GridResolution - 1);
-            int y = Mathf.Clamp(Mathf.FloorToInt(uvZ * Settings.GridResolution), 0, Settings.GridResolution - 1);
+            int x = Mathf.Clamp(Mathf.FloorToInt(uvX * _normalField.width), 0, _normalField.width - 1);
+            int y = Mathf.Clamp(Mathf.FloorToInt(uvZ * _normalField.height), 0, _normalField.height - 1);
 
             Color normalColor = tex.GetPixel(x, y);
             Vector3 normal = new Vector3(
@@ -306,14 +360,15 @@ namespace ShipHydrodynamics.Water
         public Vector2 GetWaterVelocityAtUV(float u, float v)
         {
             RenderTexture current = RenderTexture.active;
-            RenderTexture.active = VelocityField;
+            RenderTexture rt = VelocityField;
+            RenderTexture.active = rt;
 
-            Texture2D tex = new Texture2D(Settings.GridResolution, Settings.GridResolution, TextureFormat.RGFloat, false);
-            tex.ReadPixels(new Rect(0, 0, Settings.GridResolution, Settings.GridResolution), 0, 0);
+            Texture2D tex = new Texture2D(rt.width, rt.height, TextureFormat.RGFloat, false);
+            tex.ReadPixels(new Rect(0, 0, rt.width, rt.height), 0, 0);
             tex.Apply();
 
-            int x = Mathf.Clamp(Mathf.FloorToInt(u * Settings.GridResolution), 0, Settings.GridResolution - 1);
-            int y = Mathf.Clamp(Mathf.FloorToInt(v * Settings.GridResolution), 0, Settings.GridResolution - 1);
+            int x = Mathf.Clamp(Mathf.FloorToInt(u * rt.width), 0, rt.width - 1);
+            int y = Mathf.Clamp(Mathf.FloorToInt(v * rt.height), 0, rt.height - 1);
 
             Color velColor = tex.GetPixel(x, y);
             Vector2 velocity = new Vector2(velColor.r, velColor.g);
@@ -347,11 +402,12 @@ namespace ShipHydrodynamics.Water
 
         private void OnDestroy()
         {
-            ReleaseTexture(ref HeightField);
-            ReleaseTexture(ref _heightFieldPrev);
-            ReleaseTexture(ref VelocityField);
-            ReleaseTexture(ref _velocityFieldPrev);
-            ReleaseTexture(ref NormalField);
+            for (int i = 0; i < 2; i++)
+            {
+                ReleaseTexture(ref _heightFields[i]);
+                ReleaseTexture(ref _velocityFields[i]);
+            }
+            ReleaseTexture(ref _normalField);
             ReleaseTexture(ref _hullHeightMask);
 
             _waveSourceBuffer?.Release();

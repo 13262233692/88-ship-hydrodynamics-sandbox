@@ -1,17 +1,20 @@
 #pragma kernel InitializeWater
 #pragma kernel UpdateSWE
 #pragma kernel UpdateNormals
-#pragma kernel ApplyHullInteraction
-#pragma kernel ApplyBoundaryConditions
-#pragma kernel AddWaveSource
+#pragma kernel ApplyHullInteractionRead
+#pragma kernel ApplyHullInteractionWrite
+#pragma kernel ApplyBoundaryConditionsRead
+#pragma kernel ApplyBoundaryConditionsWrite
+#pragma kernel AddWaveSourceRead
+#pragma kernel AddWaveSourceWrite
 
 #define THREAD_GROUP_SIZE_X 16
 #define THREAD_GROUP_SIZE_Y 16
 
-RWTexture2D<float> _HeightField;
-RWTexture2D<float> _HeightFieldPrev;
-RWTexture2D<float2> _VelocityField;
-RWTexture2D<float2> _VelocityFieldPrev;
+Texture2D<float> _HeightFieldRead;
+RWTexture2D<float> _HeightFieldWrite;
+Texture2D<float2> _VelocityFieldRead;
+RWTexture2D<float2> _VelocityFieldWrite;
 RWTexture2D<float4> _NormalField;
 Texture2D<float> _HullHeightMask;
 
@@ -44,27 +47,25 @@ struct WaveSource
 StructuredBuffer<WaveSource> _WaveSources;
 int _WaveSourceCount;
 
+groupshared float g_sharedHeight[THREAD_GROUP_SIZE_X * THREAD_GROUP_SIZE_Y];
+groupshared float2 g_sharedVelocity[THREAD_GROUP_SIZE_X * THREAD_GROUP_SIZE_Y];
+
 bool IsInsideBounds(int2 pos)
 {
     return pos.x >= 0 && pos.x < _GridWidth &&
            pos.y >= 0 && pos.y < _GridHeight;
 }
 
-float SampleHeight(int2 pos)
+float SampleHeightRead(int2 pos)
 {
     pos = clamp(pos, int2(0, 0), int2(_GridWidth - 1, _GridHeight - 1));
-    return _HeightField[pos];
+    return _HeightFieldRead[pos];
 }
 
-float2 SampleVelocity(int2 pos)
+float2 SampleVelocityRead(int2 pos)
 {
     pos = clamp(pos, int2(0, 0), int2(_GridWidth - 1, _GridHeight - 1));
-    return _VelocityField[pos];
-}
-
-float GetDepth(int2 pos)
-{
-    return max(_RestDepth + SampleHeight(pos), 0.001f);
+    return _VelocityFieldRead[pos];
 }
 
 [numthreads(THREAD_GROUP_SIZE_X, THREAD_GROUP_SIZE_Y, 1)]
@@ -73,37 +74,38 @@ void InitializeWater(uint3 id : SV_DispatchThreadID)
     int2 pos = int2(id.x, id.y);
     if (!IsInsideBounds(pos)) return;
 
-    _HeightField[pos] = 0.0f;
-    _HeightFieldPrev[pos] = 0.0f;
-    _VelocityField[pos] = float2(0.0f, 0.0f);
-    _VelocityFieldPrev[pos] = float2(0.0f, 0.0f);
+    _HeightFieldWrite[pos] = 0.0f;
+    _VelocityFieldWrite[pos] = float2(0.0f, 0.0f);
     _NormalField[pos] = float4(0.0f, 1.0f, 0.0f, 0.0f);
 }
 
 [numthreads(THREAD_GROUP_SIZE_X, THREAD_GROUP_SIZE_Y, 1)]
-void UpdateSWE(uint3 id : SV_DispatchThreadID)
+void UpdateSWE(uint3 id : SV_DispatchThreadID, uint groupIndex : SV_GroupIndex)
 {
     int2 pos = int2(id.x, id.y);
     if (!IsInsideBounds(pos)) return;
 
-    float2 uv = float2(pos) / float2(_GridWidth, _GridHeight);
+    float h = SampleHeightRead(pos);
+    float h_L = SampleHeightRead(pos + int2(-1, 0));
+    float h_R = SampleHeightRead(pos + int2(1, 0));
+    float h_D = SampleHeightRead(pos + int2(0, -1));
+    float h_U = SampleHeightRead(pos + int2(0, 1));
 
-    float h = SampleHeight(pos);
-    float h_L = SampleHeight(pos + int2(-1, 0));
-    float h_R = SampleHeight(pos + int2(1, 0));
-    float h_D = SampleHeight(pos + int2(0, -1));
-    float h_U = SampleHeight(pos + int2(0, 1));
+    float h_LL = SampleHeightRead(pos + int2(-2, 0));
+    float h_RR = SampleHeightRead(pos + int2(2, 0));
+    float h_DD = SampleHeightRead(pos + int2(0, -2));
+    float h_UU = SampleHeightRead(pos + int2(0, 2));
 
-    float h_LL = SampleHeight(pos + int2(-2, 0));
-    float h_RR = SampleHeight(pos + int2(2, 0));
-    float h_DD = SampleHeight(pos + int2(0, -2));
-    float h_UU = SampleHeight(pos + int2(0, 2));
+    float2 vel = SampleVelocityRead(pos);
+    float2 vel_L = SampleVelocityRead(pos + int2(-1, 0));
+    float2 vel_R = SampleVelocityRead(pos + int2(1, 0));
+    float2 vel_D = SampleVelocityRead(pos + int2(0, -1));
+    float2 vel_U = SampleVelocityRead(pos + int2(0, 1));
 
-    float2 vel = SampleVelocity(pos);
-    float2 vel_L = SampleVelocity(pos + int2(-1, 0));
-    float2 vel_R = SampleVelocity(pos + int2(1, 0));
-    float2 vel_D = SampleVelocity(pos + int2(0, -1));
-    float2 vel_U = SampleVelocity(pos + int2(0, 1));
+    g_sharedHeight[groupIndex] = h;
+    g_sharedVelocity[groupIndex] = vel;
+
+    GroupMemoryBarrierWithGroupSync();
 
     float invDx = 1.0f / _CellSize;
     float inv2Dx = 0.5f * invDx;
@@ -113,7 +115,6 @@ void UpdateSWE(uint3 id : SV_DispatchThreadID)
 
     float d2hdx2 = (h_R - 2.0f * h + h_L) * invDx * invDx;
     float d2hdy2 = (h_U - 2.0f * h + h_D) * invDx * invDx;
-    float d2hdxdy = (h_R + h_L + h_U + h_D - 4.0f * h) * 0.25f * invDx * invDx;
 
     float d4hdx4 = (h_RR - 4.0f * h_R + 6.0f * h - 4.0f * h_L + h_LL) * pow(invDx, 4.0f);
     float d4hdy4 = (h_UU - 4.0f * h_U + 6.0f * h - 4.0f * h_D + h_DD) * pow(invDx, 4.0f);
@@ -129,7 +130,7 @@ void UpdateSWE(uint3 id : SV_DispatchThreadID)
     float dudx = (vel_R.x - vel_L.x) * inv2Dx;
     float dudy = (vel_U.x - vel_D.x) * inv2Dx;
     float dvdx = (vel_R.y - vel_L.y) * inv2Dx;
-    float dvdy = (vel_U.y - vel_D.y) * inv2Dy;
+    float dvdy = (vel_U.y - vel_D.y) * inv2Dx;
 
     float advectionU = vel.x * dudx + vel.y * dudy;
     float advectionV = vel.x * dvdx + vel.y * dvdy;
@@ -162,10 +163,8 @@ void UpdateSWE(uint3 id : SV_DispatchThreadID)
 
     float newH = h + _TimeStep * continuitySource;
 
-    _HeightFieldPrev[pos] = h;
-    _VelocityFieldPrev[pos] = vel;
-    _HeightField[pos] = newH;
-    _VelocityField[pos] = float2(newU, newV);
+    _HeightFieldWrite[pos] = newH;
+    _VelocityFieldWrite[pos] = float2(newU, newV);
 }
 
 [numthreads(THREAD_GROUP_SIZE_X, THREAD_GROUP_SIZE_Y, 1)]
@@ -174,16 +173,16 @@ void UpdateNormals(uint3 id : SV_DispatchThreadID)
     int2 pos = int2(id.x, id.y);
     if (!IsInsideBounds(pos)) return;
 
-    float h = SampleHeight(pos);
-    float h_L = SampleHeight(pos + int2(-1, 0));
-    float h_R = SampleHeight(pos + int2(1, 0));
-    float h_D = SampleHeight(pos + int2(0, -1));
-    float h_U = SampleHeight(pos + int2(0, 1));
+    float h = SampleHeightRead(pos);
+    float h_L = SampleHeightRead(pos + int2(-1, 0));
+    float h_R = SampleHeightRead(pos + int2(1, 0));
+    float h_D = SampleHeightRead(pos + int2(0, -1));
+    float h_U = SampleHeightRead(pos + int2(0, 1));
 
-    float h_UL = SampleHeight(pos + int2(-1, 1));
-    float h_UR = SampleHeight(pos + int2(1, 1));
-    float h_DL = SampleHeight(pos + int2(-1, -1));
-    float h_DR = SampleHeight(pos + int2(1, -1));
+    float h_UL = SampleHeightRead(pos + int2(-1, 1));
+    float h_UR = SampleHeightRead(pos + int2(1, 1));
+    float h_DL = SampleHeightRead(pos + int2(-1, -1));
+    float h_DR = SampleHeightRead(pos + int2(1, -1));
 
     float invDx = 1.0f / (8.0f * _CellSize);
 
@@ -198,7 +197,7 @@ void UpdateNormals(uint3 id : SV_DispatchThreadID)
 }
 
 [numthreads(THREAD_GROUP_SIZE_X, THREAD_GROUP_SIZE_Y, 1)]
-void ApplyHullInteraction(uint3 id : SV_DispatchThreadID)
+void ApplyHullInteractionRead(uint3 id : SV_DispatchThreadID)
 {
     int2 pos = int2(id.x, id.y);
     if (!IsInsideBounds(pos)) return;
@@ -213,6 +212,9 @@ void ApplyHullInteraction(uint3 id : SV_DispatchThreadID)
     float halfLength = _ShipLength * 0.5f;
     float halfBeam = _ShipBeam * 0.5f;
 
+    float h = SampleHeightRead(pos);
+    float2 currentVel = SampleVelocityRead(pos);
+
     if (abs(relativePos.x) < halfLength + 2.0f && abs(relativePos.y) < halfBeam + 2.0f)
     {
         float nx = relativePos.x / (halfLength + 2.0f);
@@ -223,7 +225,6 @@ void ApplyHullInteraction(uint3 id : SV_DispatchThreadID)
         if (abs(nx) < 0.95f && abs(ny) < 0.95f)
         {
             float bowFactor = pow(max(1.0f - abs(relativePos.x) / halfLength, 0.0f), 0.5f);
-            float sternFactor = max(0.0f, 1.0f - smoothstep(0.0f, halfLength, abs(relativePos.x)));
 
             float displacementWave = _ShipDraft * hullMask;
 
@@ -233,7 +234,6 @@ void ApplyHullInteraction(uint3 id : SV_DispatchThreadID)
                 float2 velDir = _ShipVelocity / speed;
                 float kelvinAngle = 19.47f * 3.14159265f / 180.0f;
                 float sinK = sin(kelvinAngle);
-                float cosK = cos(kelvinAngle);
 
                 float along = dot(relativePos, velDir);
                 float across = dot(relativePos, float2(-velDir.y, velDir.x));
@@ -247,25 +247,93 @@ void ApplyHullInteraction(uint3 id : SV_DispatchThreadID)
                 }
             }
 
-            float h = _HeightField[pos];
-            _HeightField[pos] = max(h, displacementWave * 0.5f);
+            h = max(h, displacementWave * 0.5f);
 
-            float2 currentVel = _VelocityField[pos];
             float2 pushVel = _ShipVelocity * hullMask * 0.5f;
-            _VelocityField[pos] = lerp(currentVel, pushVel, hullMask * 0.3f);
+            currentVel = lerp(currentVel, pushVel, hullMask * 0.3f);
         }
     }
 
-    float hullMask = _HullHeightMask[pos];
-    if (hullMask > 0.1f)
+    float hullMaskTex = _HullHeightMask[pos];
+    if (hullMaskTex > 0.1f)
     {
-        float currentH = _HeightField[pos];
-        _HeightField[pos] = max(currentH, _ShipDraft * hullMask * 0.5f);
+        h = max(h, _ShipDraft * hullMaskTex * 0.5f);
     }
+
+    _HeightFieldWrite[pos] = h;
+    _VelocityFieldWrite[pos] = currentVel;
 }
 
 [numthreads(THREAD_GROUP_SIZE_X, THREAD_GROUP_SIZE_Y, 1)]
-void ApplyBoundaryConditions(uint3 id : SV_DispatchThreadID)
+void ApplyHullInteractionWrite(uint3 id : SV_DispatchThreadID)
+{
+    int2 pos = int2(id.x, id.y);
+    if (!IsInsideBounds(pos)) return;
+
+    float2 worldPos = float2(
+        (float(pos.x) / _GridWidth - 0.5f) * 200.0f + _ShipPosition.x,
+        (float(pos.y) / _GridHeight - 0.5f) * 200.0f + _ShipPosition.z
+    );
+
+    float2 relativePos = worldPos - float2(_ShipPosition.x, _ShipPosition.z);
+
+    float halfLength = _ShipLength * 0.5f;
+    float halfBeam = _ShipBeam * 0.5f;
+
+    float h = _HeightFieldRead[pos];
+    float2 currentVel = _VelocityFieldRead[pos];
+
+    if (abs(relativePos.x) < halfLength + 2.0f && abs(relativePos.y) < halfBeam + 2.0f)
+    {
+        float nx = relativePos.x / (halfLength + 2.0f);
+        float ny = relativePos.y / (halfBeam + 2.0f);
+
+        float hullMask = 1.0f - smoothstep(0.7f, 1.0f, max(abs(nx), abs(ny)));
+
+        if (abs(nx) < 0.95f && abs(ny) < 0.95f)
+        {
+            float bowFactor = pow(max(1.0f - abs(relativePos.x) / halfLength, 0.0f), 0.5f);
+
+            float displacementWave = _ShipDraft * hullMask;
+
+            float speed = length(_ShipVelocity);
+            if (speed > 0.01f)
+            {
+                float2 velDir = _ShipVelocity / speed;
+                float kelvinAngle = 19.47f * 3.14159265f / 180.0f;
+                float sinK = sin(kelvinAngle);
+
+                float along = dot(relativePos, velDir);
+                float across = dot(relativePos, float2(-velDir.y, velDir.x));
+
+                if (along < 0.0f)
+                {
+                    float transverse = abs(across) - abs(along) * sinK;
+                    float waveEnvelope = exp(-abs(transverse) * 0.1f);
+                    float wavePhase = along * 2.0f * 3.14159265f / max(speed, 0.1f);
+                    displacementWave += _ShipDraft * 0.3f * sin(wavePhase + _Time * speed) * waveEnvelope * bowFactor;
+                }
+            }
+
+            h = max(h, displacementWave * 0.5f);
+
+            float2 pushVel = _ShipVelocity * hullMask * 0.5f;
+            currentVel = lerp(currentVel, pushVel, hullMask * 0.3f);
+        }
+    }
+
+    float hullMaskTex = _HullHeightMask[pos];
+    if (hullMaskTex > 0.1f)
+    {
+        h = max(h, _ShipDraft * hullMaskTex * 0.5f);
+    }
+
+    _HeightFieldWrite[pos] = h;
+    _VelocityFieldWrite[pos] = currentVel;
+}
+
+[numthreads(THREAD_GROUP_SIZE_X, THREAD_GROUP_SIZE_Y, 1)]
+void ApplyBoundaryConditionsRead(uint3 id : SV_DispatchThreadID)
 {
     int2 pos = int2(id.x, id.y);
     if (!IsInsideBounds(pos)) return;
@@ -275,10 +343,13 @@ void ApplyBoundaryConditions(uint3 id : SV_DispatchThreadID)
 
     if (isBoundary)
     {
-        _HeightField[pos] = 0.0f;
-        _VelocityField[pos] = float2(0.0f, 0.0f);
+        _HeightFieldWrite[pos] = 0.0f;
+        _VelocityFieldWrite[pos] = float2(0.0f, 0.0f);
         return;
     }
+
+    float h = SampleHeightRead(pos);
+    float2 vel = SampleVelocityRead(pos);
 
     int boundaryZone = 5;
     bool nearBoundary = pos.x < boundaryZone || pos.x > _GridWidth - 1 - boundaryZone ||
@@ -290,16 +361,58 @@ void ApplyBoundaryConditions(uint3 id : SV_DispatchThreadID)
         float dampingFactor = 1.0f - smoothstep(0.0f, float(boundaryZone), float(boundaryZone - distToEdge));
         dampingFactor = pow(dampingFactor, 2.0f);
 
-        _HeightField[pos] *= dampingFactor;
-        _VelocityField[pos] *= dampingFactor;
+        h *= dampingFactor;
+        vel *= dampingFactor;
     }
+
+    _HeightFieldWrite[pos] = h;
+    _VelocityFieldWrite[pos] = vel;
 }
 
 [numthreads(THREAD_GROUP_SIZE_X, THREAD_GROUP_SIZE_Y, 1)]
-void AddWaveSource(uint3 id : SV_DispatchThreadID)
+void ApplyBoundaryConditionsWrite(uint3 id : SV_DispatchThreadID)
 {
     int2 pos = int2(id.x, id.y);
     if (!IsInsideBounds(pos)) return;
+
+    bool isBoundary = pos.x == 0 || pos.x == _GridWidth - 1 ||
+                      pos.y == 0 || pos.y == _GridHeight - 1;
+
+    if (isBoundary)
+    {
+        _HeightFieldWrite[pos] = 0.0f;
+        _VelocityFieldWrite[pos] = float2(0.0f, 0.0f);
+        return;
+    }
+
+    float h = _HeightFieldRead[pos];
+    float2 vel = _VelocityFieldRead[pos];
+
+    int boundaryZone = 5;
+    bool nearBoundary = pos.x < boundaryZone || pos.x > _GridWidth - 1 - boundaryZone ||
+                        pos.y < boundaryZone || pos.y > _GridHeight - 1 - boundaryZone;
+
+    if (nearBoundary)
+    {
+        int distToEdge = min(min(pos.x, _GridWidth - 1 - pos.x), min(pos.y, _GridHeight - 1 - pos.y));
+        float dampingFactor = 1.0f - smoothstep(0.0f, float(boundaryZone), float(boundaryZone - distToEdge));
+        dampingFactor = pow(dampingFactor, 2.0f);
+
+        h *= dampingFactor;
+        vel *= dampingFactor;
+    }
+
+    _HeightFieldWrite[pos] = h;
+    _VelocityFieldWrite[pos] = vel;
+}
+
+[numthreads(THREAD_GROUP_SIZE_X, THREAD_GROUP_SIZE_Y, 1)]
+void AddWaveSourceRead(uint3 id : SV_DispatchThreadID)
+{
+    int2 pos = int2(id.x, id.y);
+    if (!IsInsideBounds(pos)) return;
+
+    float h = SampleHeightRead(pos);
 
     float2 worldPos = float2(
         (float(pos.x) / _GridWidth - 0.5f) * 200.0f,
@@ -325,5 +438,40 @@ void AddWaveSource(uint3 id : SV_DispatchThreadID)
         }
     }
 
-    _HeightField[pos] += totalWave * _TimeStep;
+    _HeightFieldWrite[pos] = h + totalWave * _TimeStep;
+}
+
+[numthreads(THREAD_GROUP_SIZE_X, THREAD_GROUP_SIZE_Y, 1)]
+void AddWaveSourceWrite(uint3 id : SV_DispatchThreadID)
+{
+    int2 pos = int2(id.x, id.y);
+    if (!IsInsideBounds(pos)) return;
+
+    float h = _HeightFieldRead[pos];
+
+    float2 worldPos = float2(
+        (float(pos.x) / _GridWidth - 0.5f) * 200.0f,
+        (float(pos.y) / _GridHeight - 0.5f) * 200.0f
+    );
+
+    float totalWave = 0.0f;
+
+    for (int i = 0; i < _WaveSourceCount; i++)
+    {
+        WaveSource src = _WaveSources[i];
+
+        float2 toPoint = worldPos - src.position;
+        float dist = length(toPoint);
+
+        if (dist < 100.0f)
+        {
+            float alongDir = dot(normalize(toPoint), src.direction);
+            float amplitude = src.amplitude * exp(-dist * src.decay) * max(alongDir, 0.0f);
+
+            float phase = src.frequency * dist + src.phase + _Time * src.frequency * 2.0f;
+            totalWave += amplitude * sin(phase);
+        }
+    }
+
+    _HeightFieldWrite[pos] = h + totalWave * _TimeStep;
 }
