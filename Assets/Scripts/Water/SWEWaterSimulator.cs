@@ -22,6 +22,10 @@ namespace ShipHydrodynamics.Water
         public float ShipLength = 100f;
         public float ShipBeam = 20f;
         public float ShipDraft = 8f;
+        public float BowDraft = 8f;
+        public float SternDraft = 6f;
+        public float ShipHeading = 0f;
+        public float ShipSpeed = 0f;
 
         [Header("Read-Only Output (current readable state)")]
         public RenderTexture HeightField => _heightFields[_readIndex];
@@ -43,15 +47,14 @@ namespace ShipHydrodynamics.Water
         private int _kernelInitialize;
         private int _kernelUpdateSWE;
         private int _kernelNormals;
-        private int _kernelHullRead;
-        private int _kernelHullWrite;
-        private int _kernelBoundaryRead;
-        private int _kernelBoundaryWrite;
-        private int _kernelWaveRead;
-        private int _kernelWaveWrite;
+        private int _kernelKelvinWake;
+        private int _kernelHullDisplacement;
+        private int _kernelBoundary;
+        private int _kernelWaveSource;
 
         private bool _initialized;
         private float _totalTime;
+        private bool _hasValidShipData;
 
         public event Action OnWaterUpdated;
 
@@ -132,12 +135,10 @@ namespace ShipHydrodynamics.Water
             _kernelInitialize = SWEShader.FindKernel("InitializeWater");
             _kernelUpdateSWE = SWEShader.FindKernel("UpdateSWE");
             _kernelNormals = SWEShader.FindKernel("UpdateNormals");
-            _kernelHullRead = SWEShader.FindKernel("ApplyHullInteractionRead");
-            _kernelHullWrite = SWEShader.FindKernel("ApplyHullInteractionWrite");
-            _kernelBoundaryRead = SWEShader.FindKernel("ApplyBoundaryConditionsRead");
-            _kernelBoundaryWrite = SWEShader.FindKernel("ApplyBoundaryConditionsWrite");
-            _kernelWaveRead = SWEShader.FindKernel("AddWaveSourceRead");
-            _kernelWaveWrite = SWEShader.FindKernel("AddWaveSourceWrite");
+            _kernelKelvinWake = SWEShader.FindKernel("ApplyKelvinWakePressure");
+            _kernelHullDisplacement = SWEShader.FindKernel("ApplyHullDisplacement");
+            _kernelBoundary = SWEShader.FindKernel("ApplyBoundaryConditionsRead");
+            _kernelWaveSource = SWEShader.FindKernel("AddWaveSourceRead");
         }
 
         private void CreateWaveSourceBuffer()
@@ -153,24 +154,13 @@ namespace ShipHydrodynamics.Water
         private void RunInitialization()
         {
             SetCommonParameters(_kernelInitialize);
-            SWEShader.SetTexture(_kernelInitialize, "_HeightFieldRead", _heightFields[ReadIdx]);
-            SWEShader.SetTexture(_kernelInitialize, "_HeightFieldWrite", _heightFields[WriteIdx]);
-            SWEShader.SetTexture(_kernelInitialize, "_VelocityFieldRead", _velocityFields[ReadIdx]);
-            SWEShader.SetTexture(_kernelInitialize, "_VelocityFieldWrite", _velocityFields[WriteIdx]);
-            SWEShader.SetTexture(_kernelInitialize, "_NormalField", _normalField);
-            SWEShader.SetTexture(_kernelInitialize, "_HullHeightMask", _hullHeightMask);
+            BindPingPongTextures(_kernelInitialize);
             Dispatch16x16(_kernelInitialize);
-
             SwapBuffers();
 
-            SWEShader.SetTexture(_kernelInitialize, "_HeightFieldRead", _heightFields[ReadIdx]);
-            SWEShader.SetTexture(_kernelInitialize, "_HeightFieldWrite", _heightFields[WriteIdx]);
-            SWEShader.SetTexture(_kernelInitialize, "_VelocityFieldRead", _velocityFields[ReadIdx]);
-            SWEShader.SetTexture(_kernelInitialize, "_VelocityFieldWrite", _velocityFields[WriteIdx]);
-            SWEShader.SetTexture(_kernelInitialize, "_NormalField", _normalField);
-            SWEShader.SetTexture(_kernelInitialize, "_HullHeightMask", _hullHeightMask);
+            SetCommonParameters(_kernelInitialize);
+            BindPingPongTextures(_kernelInitialize);
             Dispatch16x16(_kernelInitialize);
-
             SwapBuffers();
         }
 
@@ -185,13 +175,13 @@ namespace ShipHydrodynamics.Water
             SWEShader.SetFloat("_RestDepth", Settings.RestDepth);
             SWEShader.SetFloat("_Damping", Settings.Damping);
             SWEShader.SetFloat("_Time", _totalTime);
+            SWEShader.SetFloat("_WaterDensity", 1025f);
+            SWEShader.SetFloat("_WaterSize", Settings.WaterSize);
         }
 
-        private void SetShipParameters(int kernel)
+        private void SetKelvinWakeParameters(int kernel)
         {
-            if (ShipTransform == null) return;
-
-            Vector3 shipPos = ShipTransform.position;
+            Vector3 shipPos = ShipTransform != null ? ShipTransform.position : _shipPositionCache;
             Vector2 shipVel = new Vector2(ShipVelocity.x, ShipVelocity.z);
 
             SWEShader.SetFloats("_ShipPosition", shipPos.x, shipPos.y, shipPos.z);
@@ -199,6 +189,13 @@ namespace ShipHydrodynamics.Water
             SWEShader.SetFloat("_ShipLength", ShipLength);
             SWEShader.SetFloat("_ShipBeam", ShipBeam);
             SWEShader.SetFloat("_ShipDraft", ShipDraft);
+            SWEShader.SetFloat("_BowDraft", BowDraft);
+            SWEShader.SetFloat("_SternDraft", SternDraft);
+            SWEShader.SetFloat("_ShipHeading", ShipHeading);
+            SWEShader.SetFloat("_ShipSpeed", ShipSpeed);
+
+            float froudeNumber = ShipSpeed / Mathf.Sqrt(Settings.Gravity * ShipLength);
+            SWEShader.SetFloat("_FroudeNumber", froudeNumber);
         }
 
         private void BindPingPongTextures(int kernel)
@@ -237,52 +234,92 @@ namespace ShipHydrodynamics.Water
         private void SimulationStep()
         {
             // ── PASS 1: Add wave sources ──
-            // READ from current, WRITE to alternate
             if (WaveSources.Count > 0 && Settings.InteractiveWaveSources)
             {
-                int waveKernel = _kernelWaveRead;
-                SetCommonParameters(waveKernel);
-                BindPingPongTextures(waveKernel);
-                SWEShader.SetBuffer(waveKernel, "_WaveSources", _waveSourceBuffer);
+                SetCommonParameters(_kernelWaveSource);
+                BindPingPongTextures(_kernelWaveSource);
+                SWEShader.SetBuffer(_kernelWaveSource, "_WaveSources", _waveSourceBuffer);
                 SWEShader.SetInt("_WaveSourceCount", WaveSources.Count);
-                Dispatch16x16(waveKernel);
+                Dispatch16x16(_kernelWaveSource);
                 SwapBuffers();
             }
 
-            // ── PASS 2: Hull interaction ──
-            // READ from current (wave sources applied), WRITE to alternate
-            if (ShipTransform != null && Settings.EnableKelvinWakes)
+            // ── PASS 2: Kelvin Wake Pressure Forcing (Bernoulli) ──
+            // This is the core physics operator:
+            //   Bow   → stagnation pressure  P_bow = ½ρV² (positive, pushes water up and aside)
+            //   Sides → Bernoulli suction     P_side = -½ρV²·C (negative, water accelerates past hull)
+            //   Stern → flow separation       P_stern = -½ρV²·C (negative, suction wake)
+            // The pressure gradient ∂P/∂x, ∂P/∂y is applied to SWE momentum:
+            //   Δu = -(dt/ρ)·∂P/∂x
+            //   Δv = -(dt/ρ)·∂P/∂y
+            //   Δη = -h·(dt/ρ)·(∂P/∂x + ∂P/∂y)
+            // When V > c_min, this naturally produces:
+            //   - Transverse waves (λ = 2πV²/g) behind the ship
+            //   - Divergent waves at Kelvin angle arctan(1/√8) ≈ 19.47°
+            //   - Combined V-wake at half-angle ≈ 19.47° → full angle ≈ 39°
+            if ((ShipTransform != null || _hasValidShipData) && Settings.EnableKelvinWakes && ShipSpeed > 0.1f)
             {
-                int hullKernel = _kernelHullWrite;
-                SetCommonParameters(hullKernel);
-                BindPingPongTextures(hullKernel);
-                SetShipParameters(hullKernel);
-                Dispatch16x16(hullKernel);
+                SetCommonParameters(_kernelKelvinWake);
+                BindPingPongTextures(_kernelKelvinWake);
+                SetKelvinWakeParameters(_kernelKelvinWake);
+                Dispatch16x16(_kernelKelvinWake);
                 SwapBuffers();
             }
 
-            // ── PASS 3: SWE physics update (core) ──
-            // READ from current snapshot, WRITE to alternate — NO RACE CONDITION
+            // ── PASS 3: Hull displacement (voxel mask overlay) ──
+            if (ShipTransform != null || _hasValidShipData)
+            {
+                SetCommonParameters(_kernelHullDisplacement);
+                BindPingPongTextures(_kernelHullDisplacement);
+                SetKelvinWakeParameters(_kernelHullDisplacement);
+                Dispatch16x16(_kernelHullDisplacement);
+                SwapBuffers();
+            }
+
+            // ── PASS 4: SWE physics update (core) ──
             SetCommonParameters(_kernelUpdateSWE);
             BindPingPongTextures(_kernelUpdateSWE);
             Dispatch16x16(_kernelUpdateSWE);
             SwapBuffers();
 
-            // ── PASS 4: Boundary conditions ──
-            // READ from SWE output, WRITE to alternate
-            SetCommonParameters(_kernelBoundaryWrite);
-            BindPingPongTextures(_kernelBoundaryWrite);
-            Dispatch16x16(_kernelBoundaryWrite);
+            // ── PASS 5: Boundary conditions ──
+            SetCommonParameters(_kernelBoundary);
+            BindPingPongTextures(_kernelBoundary);
+            Dispatch16x16(_kernelBoundary);
             SwapBuffers();
 
-            // ── PASS 5: Update normals ──
-            // Pure READ from current, WRITE to _NormalField (no race — different target)
+            // ── PASS 6: Update normals ──
             SetCommonParameters(_kernelNormals);
             BindPingPongTextures(_kernelNormals);
             Dispatch16x16(_kernelNormals);
 
             OnWaterUpdated?.Invoke();
         }
+
+        public void UpdateShipWakeParameters(
+            Vector3 shipPos,
+            Vector3 shipVel,
+            float length,
+            float beam,
+            float draft,
+            float bowDraft,
+            float sternDraft,
+            float heading)
+        {
+            ShipLength = length;
+            ShipBeam = beam;
+            ShipDraft = draft;
+            BowDraft = bowDraft;
+            SternDraft = sternDraft;
+            ShipHeading = heading;
+            ShipSpeed = new Vector2(shipVel.x, shipVel.z).magnitude;
+            ShipVelocity = shipVel;
+
+            _shipPositionCache = shipPos;
+            _hasValidShipData = true;
+        }
+
+        private Vector3 _shipPositionCache;
 
         public float GetWaterHeightAtWorldPosition(Vector3 worldPos)
         {
@@ -355,28 +392,6 @@ namespace ShipHydrodynamics.Water
             Destroy(tex);
 
             return normal;
-        }
-
-        public Vector2 GetWaterVelocityAtUV(float u, float v)
-        {
-            RenderTexture current = RenderTexture.active;
-            RenderTexture rt = VelocityField;
-            RenderTexture.active = rt;
-
-            Texture2D tex = new Texture2D(rt.width, rt.height, TextureFormat.RGFloat, false);
-            tex.ReadPixels(new Rect(0, 0, rt.width, rt.height), 0, 0);
-            tex.Apply();
-
-            int x = Mathf.Clamp(Mathf.FloorToInt(u * rt.width), 0, rt.width - 1);
-            int y = Mathf.Clamp(Mathf.FloorToInt(v * rt.height), 0, rt.height - 1);
-
-            Color velColor = tex.GetPixel(x, y);
-            Vector2 velocity = new Vector2(velColor.r, velColor.g);
-
-            RenderTexture.active = current;
-            Destroy(tex);
-
-            return velocity;
         }
 
         public void AddWaveSource(WaveSource source)

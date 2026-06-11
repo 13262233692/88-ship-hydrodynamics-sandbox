@@ -96,7 +96,31 @@ namespace ShipHydrodynamics.HullForces
             if (!ApplyForces || ShipRigidbody == null) return;
 
             CalculateKinematicData();
+            PushWakeParametersToWaterSimulator();
             CalculateForces();
+        }
+
+        private void PushWakeParametersToWaterSimulator()
+        {
+            if (WaterSimulator == null || Voxelizer == null) return;
+
+            (float bowDraft, float sternDraft) = Voxelizer.GetBowAndSternDraft();
+
+            float heading = Mathf.Atan2(transform.forward.x, transform.forward.z);
+
+            float shipLength = Voxelizer.GridSettings.GridSize.x * Voxelizer.GridSettings.CellSize;
+            float shipBeam = Voxelizer.GridSettings.GridSize.z * Voxelizer.GridSettings.CellSize;
+
+            WaterSimulator.UpdateShipWakeParameters(
+                transform.position,
+                _velocity,
+                shipLength,
+                shipBeam,
+                Voxelizer.WaterlineY,
+                bowDraft,
+                sternDraft,
+                heading
+            );
         }
 
         private void CalculateKinematicData()

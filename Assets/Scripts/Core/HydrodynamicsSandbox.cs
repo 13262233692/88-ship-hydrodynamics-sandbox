@@ -428,7 +428,10 @@ namespace ShipHydrodynamics.Core
 
             if (WaterSimulator != null && ShipHydrodynamics != null)
             {
-                WaterSimulator.ShipVelocity = ShipHydrodynamics.Velocity;
+                if (WaterSimulator.ShipTransform != null)
+                {
+                    WaterSimulator.ShipVelocity = ShipHydrodynamics.Velocity;
+                }
             }
         }
 

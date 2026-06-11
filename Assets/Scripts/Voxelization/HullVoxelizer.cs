@@ -328,5 +328,128 @@ namespace ShipHydrodynamics.Voxelization
         {
             _needsUpdate = true;
         }
+
+        public float GetBowDraft()
+        {
+            if (_voxelGridBuffer == null || _voxelDataCPU == null) return WaterlineY;
+
+            _voxelGridBuffer.GetData(_voxelDataCPU);
+
+            int gsx = GridSettings.GridSize.x;
+            int gsy = GridSettings.GridSize.y;
+            int gsz = GridSettings.GridSize.z;
+            float cellSize = GridSettings.CellSize;
+            float maxDraft = 0f;
+            int bowSliceCount = Mathf.Max(1, gsx / 5);
+
+            for (int x = gsx - bowSliceCount; x < gsx; x++)
+            {
+                for (int y = 0; y < gsy; y++)
+                {
+                    for (int z = 0; z < gsz; z++)
+                    {
+                        int idx = x + y * gsx + z * gsx * gsy;
+                        if (idx < _voxelDataCPU.Length && _voxelDataCPU[idx].isSubmerged == 1)
+                        {
+                            float voxelWorldY = GridSettings.GetGridMin(transform.position).y + (y + 0.5f) * cellSize;
+                            float draftAtVoxel = WaterlineY - voxelWorldY;
+                            if (draftAtVoxel > maxDraft)
+                            {
+                                maxDraft = draftAtVoxel;
+                            }
+                        }
+                    }
+                }
+            }
+
+            return maxDraft > 0.01f ? maxDraft : WaterlineY;
+        }
+
+        public float GetSternDraft()
+        {
+            if (_voxelGridBuffer == null || _voxelDataCPU == null) return WaterlineY;
+
+            _voxelGridBuffer.GetData(_voxelDataCPU);
+
+            int gsx = GridSettings.GridSize.x;
+            int gsy = GridSettings.GridSize.y;
+            int gsz = GridSettings.GridSize.z;
+            float cellSize = GridSettings.CellSize;
+            float maxDraft = 0f;
+            int sternSliceCount = Mathf.Max(1, gsx / 5);
+
+            for (int x = 0; x < sternSliceCount; x++)
+            {
+                for (int y = 0; y < gsy; y++)
+                {
+                    for (int z = 0; z < gsz; z++)
+                    {
+                        int idx = x + y * gsx + z * gsx * gsy;
+                        if (idx < _voxelDataCPU.Length && _voxelDataCPU[idx].isSubmerged == 1)
+                        {
+                            float voxelWorldY = GridSettings.GetGridMin(transform.position).y + (y + 0.5f) * cellSize;
+                            float draftAtVoxel = WaterlineY - voxelWorldY;
+                            if (draftAtVoxel > maxDraft)
+                            {
+                                maxDraft = draftAtVoxel;
+                            }
+                        }
+                    }
+                }
+            }
+
+            return maxDraft > 0.01f ? maxDraft : WaterlineY;
+        }
+
+        public (float bowDraft, float sternDraft) GetBowAndSternDraft()
+        {
+            if (_voxelGridBuffer == null || _voxelDataCPU == null) return (WaterlineY, WaterlineY);
+
+            _voxelGridBuffer.GetData(_voxelDataCPU);
+
+            int gsx = GridSettings.GridSize.x;
+            int gsy = GridSettings.GridSize.y;
+            int gsz = GridSettings.GridSize.z;
+            float cellSize = GridSettings.CellSize;
+            float gridMinY = GridSettings.GetGridMin(transform.position).y;
+            int sliceCount = Mathf.Max(1, gsx / 5);
+
+            float maxBowDraft = 0f;
+            for (int x = gsx - sliceCount; x < gsx; x++)
+            {
+                for (int y = 0; y < gsy; y++)
+                {
+                    for (int z = 0; z < gsz; z++)
+                    {
+                        int idx = x + y * gsx + z * gsx * gsy;
+                        if (idx < _voxelDataCPU.Length && _voxelDataCPU[idx].isSubmerged == 1)
+                        {
+                            float draftAtVoxel = WaterlineY - (gridMinY + (y + 0.5f) * cellSize);
+                            if (draftAtVoxel > maxBowDraft) maxBowDraft = draftAtVoxel;
+                        }
+                    }
+                }
+            }
+
+            float maxSternDraft = 0f;
+            for (int x = 0; x < sliceCount; x++)
+            {
+                for (int y = 0; y < gsy; y++)
+                {
+                    for (int z = 0; z < gsz; z++)
+                    {
+                        int idx = x + y * gsx + z * gsx * gsy;
+                        if (idx < _voxelDataCPU.Length && _voxelDataCPU[idx].isSubmerged == 1)
+                        {
+                            float draftAtVoxel = WaterlineY - (gridMinY + (y + 0.5f) * cellSize);
+                            if (draftAtVoxel > maxSternDraft) maxSternDraft = draftAtVoxel;
+                        }
+                    }
+                }
+            }
+
+            return (maxBowDraft > 0.01f ? maxBowDraft : WaterlineY,
+                    maxSternDraft > 0.01f ? maxSternDraft : WaterlineY);
+        }
     }
 }

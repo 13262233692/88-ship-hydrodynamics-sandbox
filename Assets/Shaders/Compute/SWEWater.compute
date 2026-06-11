@@ -1,15 +1,14 @@
 #pragma kernel InitializeWater
 #pragma kernel UpdateSWE
 #pragma kernel UpdateNormals
-#pragma kernel ApplyHullInteractionRead
-#pragma kernel ApplyHullInteractionWrite
+#pragma kernel ApplyKelvinWakePressure
+#pragma kernel ApplyHullDisplacement
 #pragma kernel ApplyBoundaryConditionsRead
-#pragma kernel ApplyBoundaryConditionsWrite
 #pragma kernel AddWaveSourceRead
-#pragma kernel AddWaveSourceWrite
 
 #define THREAD_GROUP_SIZE_X 16
 #define THREAD_GROUP_SIZE_Y 16
+#define PI 3.14159265358979323846f
 
 Texture2D<float> _HeightFieldRead;
 RWTexture2D<float> _HeightFieldWrite;
@@ -27,12 +26,19 @@ float _Viscosity;
 float _RestDepth;
 float _Damping;
 float _Time;
+float _WaterDensity;
+float _WaterSize;
 
 float3 _ShipPosition;
 float2 _ShipVelocity;
 float _ShipLength;
 float _ShipBeam;
 float _ShipDraft;
+float _BowDraft;
+float _SternDraft;
+float _ShipHeading;
+float _ShipSpeed;
+float _FroudeNumber;
 
 struct WaveSource
 {
@@ -66,6 +72,12 @@ float2 SampleVelocityRead(int2 pos)
 {
     pos = clamp(pos, int2(0, 0), int2(_GridWidth - 1, _GridHeight - 1));
     return _VelocityFieldRead[pos];
+}
+
+float2 GridToWorld(int2 pos)
+{
+    float2 uv = float2(pos) / float2(_GridWidth, _GridHeight);
+    return (uv - 0.5f) * _WaterSize;
 }
 
 [numthreads(THREAD_GROUP_SIZE_X, THREAD_GROUP_SIZE_Y, 1)]
@@ -196,140 +208,187 @@ void UpdateNormals(uint3 id : SV_DispatchThreadID)
     _NormalField[pos] = float4(normal, slope);
 }
 
-[numthreads(THREAD_GROUP_SIZE_X, THREAD_GROUP_SIZE_Y, 1)]
-void ApplyHullInteractionRead(uint3 id : SV_DispatchThreadID)
+float2x2 RotationMatrix2D(float angle)
 {
-    int2 pos = int2(id.x, id.y);
-    if (!IsInsideBounds(pos)) return;
+    float s = sin(angle);
+    float c = cos(angle);
+    return float2x2(c, -s, s, c);
+}
 
-    float2 worldPos = float2(
-        (float(pos.x) / _GridWidth - 0.5f) * 200.0f + _ShipPosition.x,
-        (float(pos.y) / _GridHeight - 0.5f) * 200.0f + _ShipPosition.z
-    );
-
-    float2 relativePos = worldPos - float2(_ShipPosition.x, _ShipPosition.z);
-
-    float halfLength = _ShipLength * 0.5f;
-    float halfBeam = _ShipBeam * 0.5f;
-
-    float h = SampleHeightRead(pos);
-    float2 currentVel = SampleVelocityRead(pos);
-
-    if (abs(relativePos.x) < halfLength + 2.0f && abs(relativePos.y) < halfBeam + 2.0f)
-    {
-        float nx = relativePos.x / (halfLength + 2.0f);
-        float ny = relativePos.y / (halfBeam + 2.0f);
-
-        float hullMask = 1.0f - smoothstep(0.7f, 1.0f, max(abs(nx), abs(ny)));
-
-        if (abs(nx) < 0.95f && abs(ny) < 0.95f)
-        {
-            float bowFactor = pow(max(1.0f - abs(relativePos.x) / halfLength, 0.0f), 0.5f);
-
-            float displacementWave = _ShipDraft * hullMask;
-
-            float speed = length(_ShipVelocity);
-            if (speed > 0.01f)
-            {
-                float2 velDir = _ShipVelocity / speed;
-                float kelvinAngle = 19.47f * 3.14159265f / 180.0f;
-                float sinK = sin(kelvinAngle);
-
-                float along = dot(relativePos, velDir);
-                float across = dot(relativePos, float2(-velDir.y, velDir.x));
-
-                if (along < 0.0f)
-                {
-                    float transverse = abs(across) - abs(along) * sinK;
-                    float waveEnvelope = exp(-abs(transverse) * 0.1f);
-                    float wavePhase = along * 2.0f * 3.14159265f / max(speed, 0.1f);
-                    displacementWave += _ShipDraft * 0.3f * sin(wavePhase + _Time * speed) * waveEnvelope * bowFactor;
-                }
-            }
-
-            h = max(h, displacementWave * 0.5f);
-
-            float2 pushVel = _ShipVelocity * hullMask * 0.5f;
-            currentVel = lerp(currentVel, pushVel, hullMask * 0.3f);
-        }
-    }
-
-    float hullMaskTex = _HullHeightMask[pos];
-    if (hullMaskTex > 0.1f)
-    {
-        h = max(h, _ShipDraft * hullMaskTex * 0.5f);
-    }
-
-    _HeightFieldWrite[pos] = h;
-    _VelocityFieldWrite[pos] = currentVel;
+float Gaussian2D(float2 p, float sigma)
+{
+    return exp(-dot(p, p) / (2.0f * sigma * sigma));
 }
 
 [numthreads(THREAD_GROUP_SIZE_X, THREAD_GROUP_SIZE_Y, 1)]
-void ApplyHullInteractionWrite(uint3 id : SV_DispatchThreadID)
+void ApplyKelvinWakePressure(uint3 id : SV_DispatchThreadID)
 {
     int2 pos = int2(id.x, id.y);
     if (!IsInsideBounds(pos)) return;
 
-    float2 worldPos = float2(
-        (float(pos.x) / _GridWidth - 0.5f) * 200.0f + _ShipPosition.x,
-        (float(pos.y) / _GridHeight - 0.5f) * 200.0f + _ShipPosition.z
-    );
+    float2 worldPos = GridToWorld(pos);
+    float h = SampleHeightRead(pos);
+    float2 vel = SampleVelocityRead(pos);
 
-    float2 relativePos = worldPos - float2(_ShipPosition.x, _ShipPosition.z);
+    float speed = _ShipSpeed;
 
-    float halfLength = _ShipLength * 0.5f;
-    float halfBeam = _ShipBeam * 0.5f;
-
-    float h = _HeightFieldRead[pos];
-    float2 currentVel = _VelocityFieldRead[pos];
-
-    if (abs(relativePos.x) < halfLength + 2.0f && abs(relativePos.y) < halfBeam + 2.0f)
+    if (speed < 0.1f)
     {
-        float nx = relativePos.x / (halfLength + 2.0f);
-        float ny = relativePos.y / (halfBeam + 2.0f);
+        _HeightFieldWrite[pos] = h;
+        _VelocityFieldWrite[pos] = vel;
+        return;
+    }
 
-        float hullMask = 1.0f - smoothstep(0.7f, 1.0f, max(abs(nx), abs(ny)));
+    float2 shipPos2D = float2(_ShipPosition.x, _ShipPosition.z);
+    float2 relPos = worldPos - shipPos2D;
 
-        if (abs(nx) < 0.95f && abs(ny) < 0.95f)
+    float cosH = cos(_ShipHeading);
+    float sinH = sin(_ShipHeading);
+    float2x2 toLocal = float2x2(cosH, sinH, -sinH, cosH);
+
+    float2 localPos = mul(toLocal, relPos);
+
+    float halfL = _ShipLength * 0.5f;
+    float halfB = _ShipBeam * 0.5f;
+
+    float bowLocal = halfL;
+    float sternLocal = -halfL;
+
+    float q = 0.5f * _WaterDensity * speed * speed;
+
+    float bowSigmaX = _ShipBeam * 0.5f;
+    float bowSigmaY = _ShipBeam * 0.8f;
+    float sternSigmaX = _ShipBeam * 0.8f;
+    float sternSigmaY = _ShipBeam * 1.5f;
+
+    float2 bowCenter = float2(bowLocal * 0.85f, 0.0f);
+    float2 bowP = localPos - bowCenter;
+    float bowEnvelope = Gaussian2D(bowP, bowSigmaX) * smoothstep(halfB * 2.0f, 0.0f, abs(localPos.y));
+    float bowPressure = q * (_BowDraft / max(_ShipDraft, 0.01f)) * bowEnvelope;
+
+    float2 midP = float2(0.0f, 0.0f);
+    float2 sideOffset = float2(0.0f, halfB * 0.8f);
+    float sideSigmaX = halfL * 0.6f;
+    float sideSigmaY = _ShipBeam * 0.5f;
+
+    float2 sideP_L = localPos + sideOffset;
+    float2 sideP_R = localPos - sideOffset;
+
+    float sideEnv_L = Gaussian2D(sideP_L / float2(sideSigmaX, sideSigmaY), 1.0f);
+    float sideEnv_R = Gaussian2D(sideP_R / float2(sideSigmaX, sideSigmaY), 1.0f);
+
+    float draftRatio = _ShipDraft / max(_RestDepth, 0.01f);
+    float blockageCoeff = draftRatio * (1.0f + draftRatio);
+
+    float sidePressure = -q * 0.35f * blockageCoeff * (sideEnv_L + sideEnv_R);
+
+    float2 sternCenter = float2(sternLocal * 0.8f, 0.0f);
+    float2 sternP = localPos - sternCenter;
+    float sternEnvelope = Gaussian2D(sternP, sternSigmaX) * smoothstep(halfB * 3.0f, 0.0f, abs(localPos.y));
+    float sternPressure = -q * 0.5f * (_SternDraft / max(_ShipDraft, 0.01f)) * sternEnvelope;
+
+    float P_total = bowPressure + sidePressure + sternPressure;
+
+    float epsilon = _CellSize * 1.5f;
+    float2 localPos_dX = localPos + float2(epsilon, 0.0f);
+    float2 localPos_dY = localPos + float2(0.0f, epsilon);
+
+    float2 bowP_dX = localPos_dX - bowCenter;
+    float bowEnv_dX = Gaussian2D(bowP_dX, bowSigmaX) * smoothstep(halfB * 2.0f, 0.0f, abs(localPos_dX.y));
+    float bowP_dY = localPos_dY - bowCenter;
+    float bowEnv_dY = Gaussian2D(bowP_dY, bowSigmaX) * smoothstep(halfB * 2.0f, 0.0f, abs(localPos_dY.y));
+
+    float2 sideP_L_dX = localPos_dX + sideOffset;
+    float2 sideP_R_dX = localPos_dX - sideOffset;
+    float sideEnv_dX = Gaussian2D(sideP_L_dX / float2(sideSigmaX, sideSigmaY), 1.0f) +
+                       Gaussian2D(sideP_R_dX / float2(sideSigmaX, sideSigmaY), 1.0f);
+
+    float2 sideP_L_dY = localPos_dY + sideOffset;
+    float2 sideP_R_dY = localPos_dY - sideOffset;
+    float sideEnv_dY = Gaussian2D(sideP_L_dY / float2(sideSigmaX, sideSigmaY), 1.0f) +
+                       Gaussian2D(sideP_R_dY / float2(sideSigmaX, sideSigmaY), 1.0f);
+
+    float2 sternP_dX = localPos_dX - sternCenter;
+    float sternEnv_dX = Gaussian2D(sternP_dX, sternSigmaX) * smoothstep(halfB * 3.0f, 0.0f, abs(localPos_dX.y));
+    float2 sternP_dY = localPos_dY - sternCenter;
+    float sternEnv_dY = Gaussian2D(sternP_dY, sternSigmaX) * smoothstep(halfB * 3.0f, 0.0f, abs(localPos_dY.y));
+
+    float P_dX = q * (_BowDraft / max(_ShipDraft, 0.01f)) * bowEnv_dX
+               - q * 0.35f * blockageCoeff * sideEnv_dX
+               - q * 0.5f * (_SternDraft / max(_ShipDraft, 0.01f)) * sternEnv_dX;
+
+    float P_dY = q * (_BowDraft / max(_ShipDraft, 0.01f)) * bowEnv_dY
+               - q * 0.35f * blockageCoeff * sideEnv_dY
+               - q * 0.5f * (_SternDraft / max(_ShipDraft, 0.01f)) * sternEnv_dY;
+
+    float2 dPdLocal = float2(P_dX - P_total, P_dY - P_total) / epsilon;
+
+    float2x2 toWorld = float2x2(cosH, -sinH, sinH, cosH);
+    float2 dPdWorld = mul(toWorld, dPdLocal);
+
+    float invRho = 1.0f / _WaterDensity;
+    float2 pressureForceVelocity = -invRho * dPdWorld;
+
+    float depthAtPoint = max(_RestDepth + h, 0.001f);
+    float pressureForceHeight = -depthAtPoint * invRho * dPdWorld.x;
+    float pressureForceHeightY = -depthAtPoint * invRho * dPdWorld.y;
+
+    float hullMask = 0.0f;
+    float2 localAbs = float2(abs(localPos.x), abs(localPos.y));
+    if (localAbs.x < halfL * 1.1f && localAbs.y < halfB * 1.5f)
+    {
+        float nx = localAbs.x / (halfL * 1.1f);
+        float ny = localAbs.y / (halfB * 1.5f);
+        hullMask = 1.0f - smoothstep(0.85f, 1.0f, max(nx, ny));
+
+        if (localAbs.x < halfL * 0.9f && localAbs.y < halfB * 0.9f)
         {
-            float bowFactor = pow(max(1.0f - abs(relativePos.x) / halfLength, 0.0f), 0.5f);
-
-            float displacementWave = _ShipDraft * hullMask;
-
-            float speed = length(_ShipVelocity);
-            if (speed > 0.01f)
-            {
-                float2 velDir = _ShipVelocity / speed;
-                float kelvinAngle = 19.47f * 3.14159265f / 180.0f;
-                float sinK = sin(kelvinAngle);
-
-                float along = dot(relativePos, velDir);
-                float across = dot(relativePos, float2(-velDir.y, velDir.x));
-
-                if (along < 0.0f)
-                {
-                    float transverse = abs(across) - abs(along) * sinK;
-                    float waveEnvelope = exp(-abs(transverse) * 0.1f);
-                    float wavePhase = along * 2.0f * 3.14159265f / max(speed, 0.1f);
-                    displacementWave += _ShipDraft * 0.3f * sin(wavePhase + _Time * speed) * waveEnvelope * bowFactor;
-                }
-            }
-
-            h = max(h, displacementWave * 0.5f);
-
-            float2 pushVel = _ShipVelocity * hullMask * 0.5f;
-            currentVel = lerp(currentVel, pushVel, hullMask * 0.3f);
+            hullMask = 1.0f;
         }
     }
 
+    float Fr = speed / sqrt(_Gravity * _ShipLength);
+    float kelvinStrength = smoothstep(0.05f, 0.2f, Fr);
+
+    float2 newVel = vel;
+    newVel += _TimeStep * pressureForceVelocity * kelvinStrength;
+
+    if (hullMask > 0.5f)
+    {
+        float2 shipVel2D = _ShipVelocity;
+        newVel = lerp(newVel, shipVel2D * 0.3f, hullMask * 0.4f);
+    }
+
+    float newH = h;
+    newH -= _TimeStep * (pressureForceHeight + pressureForceHeightY) * kelvinStrength * 0.5f;
+
+    if (hullMask > 0.8f)
+    {
+        float draftContribution = _ShipDraft * hullMask * 0.3f;
+        newH = max(newH, draftContribution);
+    }
+
+    _HeightFieldWrite[pos] = newH;
+    _VelocityFieldWrite[pos] = newVel;
+}
+
+[numthreads(THREAD_GROUP_SIZE_X, THREAD_GROUP_SIZE_Y, 1)]
+void ApplyHullDisplacement(uint3 id : SV_DispatchThreadID)
+{
+    int2 pos = int2(id.x, id.y);
+    if (!IsInsideBounds(pos)) return;
+
+    float h = SampleHeightRead(pos);
+    float2 vel = SampleVelocityRead(pos);
     float hullMaskTex = _HullHeightMask[pos];
+
     if (hullMaskTex > 0.1f)
     {
         h = max(h, _ShipDraft * hullMaskTex * 0.5f);
     }
 
     _HeightFieldWrite[pos] = h;
-    _VelocityFieldWrite[pos] = currentVel;
+    _VelocityFieldWrite[pos] = vel;
 }
 
 [numthreads(THREAD_GROUP_SIZE_X, THREAD_GROUP_SIZE_Y, 1)]
@@ -370,84 +429,12 @@ void ApplyBoundaryConditionsRead(uint3 id : SV_DispatchThreadID)
 }
 
 [numthreads(THREAD_GROUP_SIZE_X, THREAD_GROUP_SIZE_Y, 1)]
-void ApplyBoundaryConditionsWrite(uint3 id : SV_DispatchThreadID)
-{
-    int2 pos = int2(id.x, id.y);
-    if (!IsInsideBounds(pos)) return;
-
-    bool isBoundary = pos.x == 0 || pos.x == _GridWidth - 1 ||
-                      pos.y == 0 || pos.y == _GridHeight - 1;
-
-    if (isBoundary)
-    {
-        _HeightFieldWrite[pos] = 0.0f;
-        _VelocityFieldWrite[pos] = float2(0.0f, 0.0f);
-        return;
-    }
-
-    float h = _HeightFieldRead[pos];
-    float2 vel = _VelocityFieldRead[pos];
-
-    int boundaryZone = 5;
-    bool nearBoundary = pos.x < boundaryZone || pos.x > _GridWidth - 1 - boundaryZone ||
-                        pos.y < boundaryZone || pos.y > _GridHeight - 1 - boundaryZone;
-
-    if (nearBoundary)
-    {
-        int distToEdge = min(min(pos.x, _GridWidth - 1 - pos.x), min(pos.y, _GridHeight - 1 - pos.y));
-        float dampingFactor = 1.0f - smoothstep(0.0f, float(boundaryZone), float(boundaryZone - distToEdge));
-        dampingFactor = pow(dampingFactor, 2.0f);
-
-        h *= dampingFactor;
-        vel *= dampingFactor;
-    }
-
-    _HeightFieldWrite[pos] = h;
-    _VelocityFieldWrite[pos] = vel;
-}
-
-[numthreads(THREAD_GROUP_SIZE_X, THREAD_GROUP_SIZE_Y, 1)]
 void AddWaveSourceRead(uint3 id : SV_DispatchThreadID)
 {
     int2 pos = int2(id.x, id.y);
     if (!IsInsideBounds(pos)) return;
 
     float h = SampleHeightRead(pos);
-
-    float2 worldPos = float2(
-        (float(pos.x) / _GridWidth - 0.5f) * 200.0f,
-        (float(pos.y) / _GridHeight - 0.5f) * 200.0f
-    );
-
-    float totalWave = 0.0f;
-
-    for (int i = 0; i < _WaveSourceCount; i++)
-    {
-        WaveSource src = _WaveSources[i];
-
-        float2 toPoint = worldPos - src.position;
-        float dist = length(toPoint);
-
-        if (dist < 100.0f)
-        {
-            float alongDir = dot(normalize(toPoint), src.direction);
-            float amplitude = src.amplitude * exp(-dist * src.decay) * max(alongDir, 0.0f);
-
-            float phase = src.frequency * dist + src.phase + _Time * src.frequency * 2.0f;
-            totalWave += amplitude * sin(phase);
-        }
-    }
-
-    _HeightFieldWrite[pos] = h + totalWave * _TimeStep;
-}
-
-[numthreads(THREAD_GROUP_SIZE_X, THREAD_GROUP_SIZE_Y, 1)]
-void AddWaveSourceWrite(uint3 id : SV_DispatchThreadID)
-{
-    int2 pos = int2(id.x, id.y);
-    if (!IsInsideBounds(pos)) return;
-
-    float h = _HeightFieldRead[pos];
 
     float2 worldPos = float2(
         (float(pos.x) / _GridWidth - 0.5f) * 200.0f,
